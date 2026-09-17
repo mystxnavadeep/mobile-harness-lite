@@ -1,0 +1,198 @@
+name: Debug APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'Build variant (flavor)'
+        required: false
+        default: 'online'
+        type: choice
+        options:
+          - online
+          - offline
+  push:
+    branches:
+      - main
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.14.3'
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 36
+          build-tools-version: 35.0.0
+          ndk-version: r26d
+
+      - name: Detect Gradle project
+        id: detect
+        run: |
+          PROJECT_ROOT=$(find . -name "settings.gradle*" -not -path "*/build/*" -not -path "*/.gradle/*" | head -1 | xargs dirname)
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "No Gradle project found"
+            exit 1
+          fi
+          echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
+          echo "Found Gradle project at: $PROJECT_ROOT"
+
+      - name: Make gradlew executable
+        run: chmod +x ${{ steps.detect.outputs.project_root }}/gradlew
+
+      - name: Determine build task
+        id: build_task
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FLAVOR="${{ github.event.inputs.build_variant }}"
+          else
+            FLAVOR="online"
+          fi
+          echo "flavor=$FLAVOR" >> $GITHUB_OUTPUT
+          GRADLE_TASK="assemble${FLAVOR^}Debug"
+          echo "gradle_task=$GRADLE_TASK" >> $GITHUB_OUTPUT
+          echo "Building $FLAVOR debug variant with task: $GRADLE_TASK"
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.detect.outputs.project_root }}
+        run: |
+          echo "Running: ./gradlew ${{ steps.build_task.outputs.gradle_task }}"
+          ./gradlew ${{ steps.build_task.outputs.gradle_task }} --no-daemon --console=plain
+
+      - name: Find and verify APK
+        id: apk
+        working-directory: ${{ steps.detect.outputs.project_root }}
+        run: |
+          FLAVOR="${{ steps.build_task.outputs.flavor }}"
+          APK_PATTERN="**/outputs/apk/${FLAVOR}/debug/*.apk"
+          APKS=$(find . -path "$APK_PATTERN" -name "*.apk" | grep -v "unsigned" | grep -v "unaligned" || true)
+          if [ -z "$APKS" ]; then
+            echo "No $FLAVOR debug APK found"
+            echo "Searched pattern: $APK_PATTERN"
+            exit 1
+          fi
+          FIRST_APK=$(echo "$APKS" | head -1)
+          SIZE=$(stat -c%s "$FIRST_APK")
+          if [ "$SIZE" -eq 0 ]; then
+            echo "APK is empty: $FIRST_APK"
+            exit 1
+          fi
+          echo "Found APK: $FIRST_APK ($SIZE bytes)"
+          echo "apk_path=$FIRST_APK" >> $GITHUB_OUTPUT
+          echo "apk_size=$SIZE" >> $GITHUB_OUTPUT
+
+      - name: Calculate SHA-256
+        id: sha256
+        working-directory: ${{ steps.detect.outputs.project_root }}
+        run: |
+          SHA256=$(sha256sum "${{ steps.apk.outputs.apk_path }}" | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "SHA-256: $SHA256"
+
+      - name: Inspect APK metadata
+        id: version
+        working-directory: ${{ steps.detect.outputs.project_root }}
+        run: |
+          if command -v aapt2 &> /dev/null; then
+            AAPT2=aapt2
+          elif command -v aapt &> /dev/null; then
+            AAPT2=aapt
+          else
+            echo "aapt/aapt2 not found, skipping APK inspection"
+            echo "package=unknown" >> $GITHUB_OUTPUT
+            echo "version_code=unknown" >> $GITHUB_OUTPUT
+            echo "version_name=unknown" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          BADGING=$($AAPT2 dump badging "${{ steps.apk.outputs.apk_path }}" 2>/dev/null | head -30)
+          echo "APK badging output:"
+          echo "$BADGING"
+          PACKAGE=$(echo "$BADGING" | grep -oP "package: name='\K[^']*" || echo "unknown")
+          VERSION_CODE=$(echo "$BADGING" | grep -oP "versionCode='\K[^']*" || echo "unknown")
+          VERSION_NAME=$(echo "$BADGING" | grep -oP "versionName='\K[^']*" || echo "unknown")
+          echo "package=$PACKAGE" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+
+      - name: Rename APK for artifact
+        id: rename_apk
+        run: |
+          FLAVOR="${{ steps.build_task.outputs.flavor }}"
+          VERSION="${{ steps.version.outputs.version_name }}"
+          if [ "$VERSION" = "unknown" ] || [ -z "$VERSION" ]; then
+            NEW_NAME="Mobile-Harness-Lite-${FLAVOR}-debug.apk"
+          else
+            NEW_NAME="Mobile-Harness-Lite-v${VERSION}-${FLAVOR}-debug.apk"
+          fi
+          cp "${{ steps.apk.outputs.apk_path }}" "./$NEW_NAME"
+          echo "renamed_apk=$NEW_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mobile-Harness-Lite-${{ steps.build_task.outputs.flavor }}-debug-apk
+          path: ${{ steps.detect.outputs.project_root }}/${{ steps.apk.outputs.apk_path }}
+          retention-days: 7
+
+      - name: Job Summary
+        run: |
+          FLAVOR="${{ steps.build_task.outputs.flavor }}"
+          APK_SIZE="${{ steps.apk.outputs.apk_size }}"
+          SHA256="${{ steps.sha256.outputs.sha256 }}"
+          PACKAGE="${{ steps.version.outputs.package }}"
+          VERSION_CODE="${{ steps.version.outputs.version_code }}"
+          VERSION_NAME="${{ steps.version.outputs.version_name }}"
+          RENAMED="${{ steps.rename_apk.outputs.renamed_apk }}"
+
+          # Format size
+          if command -v numfmt &> /dev/null; then
+            SIZE_FMT=$(numfmt --to=iec-i --suffix=B "${APK_SIZE:-0}")
+          else
+            SIZE_FMT="${APK_SIZE:-0} bytes"
+          fi
+
+          {
+            echo "# Mobile-Harness-Lite Debug APK"
+            echo ""
+            echo "**Build Variant:** ${FLAVOR} Debug"
+            echo ""
+            echo "**APK:** \`${RENAMED}\`"
+            echo ""
+            echo "**APK Size:** ${SIZE_FMT}"
+            echo ""
+            echo "**SHA-256:** \`${SHA256}\`"
+            echo ""
+            echo "**Package:** \`${PACKAGE}\`"
+            echo ""
+            echo "**Version Code:** ${VERSION_CODE}"
+            echo ""
+            echo "**Version Name:** ${VERSION_NAME}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "> **This is a debug APK intended for testing and is not a production release.**"
+            echo ""
+            echo "> Debug APKs are signed with Android's default debug keystore and are not suitable for distribution."
+          } >> $GITHUB_STEP_SUMMARY

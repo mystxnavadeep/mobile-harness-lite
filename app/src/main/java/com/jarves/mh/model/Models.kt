@@ -33,6 +33,24 @@ data class ProviderProfile(
 
 enum class ProjectKind { PROJECT, QUICK_PROJECT }
 
+/** Build mode for Android projects */
+enum class BuildMode {
+    LOCAL("Local Development", "Build APKs directly on this device (requires Android toolchain)"),
+    CLOUD("Cloud Build (GitHub Actions)", "Build APKs on GitHub Actions servers — no local Android SDK needed"),
+}
+
+/** GitHub repository link for cloud builds. */
+data class GitHubRepoLink(
+    val owner: String,
+    val repo: String,
+    val branch: String = "main",
+) {
+    val fullName: String get() = "$owner/$repo"
+    val cloneUrl: String get() = "https://github.com/$owner/$repo.git"
+    val htmlUrl: String get() = "https://github.com/$owner/$repo"
+    val actionsUrl: String get() = "https://github.com/$owner/$repo/actions"
+}
+
 data class Project(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
@@ -42,6 +60,12 @@ data class Project(
     val rootPath: String = "",
     val updatedAtMillis: Long = System.currentTimeMillis(),
     val kind: ProjectKind = ProjectKind.PROJECT,
+    /** Preferred build mode for this project. Null means auto-detect. */
+    val buildMode: BuildMode? = null,
+    /** GitHub repository link for cloud builds. */
+    val githubRepoLink: GitHubRepoLink? = null,
+    /** Vercel project ID for web deployments. */
+    val vercelProjectId: String? = null,
 ) {
     val formattedUpdatedAt: String
         get() {
@@ -105,9 +129,10 @@ data class WorkspaceEntry(
 enum class RiskLevel { SAFE, REVIEW, HIGH }
 
 /**
- * Optional development toolchains the user can pick during onboarding.
- * Node.js, npm, Git, and Claude Code itself are always installed because the
- * agent runtime depends on them; these stacks add heavier extras on demand.
+ * Lightweight optional development toolchains.
+ * In Lite mode, we only keep WEB (Node.js/npm/Git are in Core runtime).
+ * Heavy toolchains (Android, Python, C/C++, PHP) are intentionally removed —
+ * use Cloud Build Mode for Android APKs and Vercel for web previews.
  */
 enum class DevStack(
     val label: String,
@@ -117,29 +142,35 @@ enum class DevStack(
     WEB(
         "Web (JavaScript / TypeScript)",
         "Websites and web apps with HTML, CSS, and JS frameworks.",
-        "Node.js and npm (already included)",
-    ),
-    PYTHON(
-        "Python",
-        "Scripts, automation, data work, and Python backends.",
-        "python3, pip, venv, and build tools",
-    ),
-    ANDROID(
-        "Android (Java / Kotlin)",
-        "Build Android app projects and install them directly on this phone.",
-        "JDK 17, ARM64 Android SDK 36, Build Tools 35, Gradle 8.14.3, and an offline Maven cache",
-    ),
-    CPP(
-        "C / C++",
-        "Fast compiled programs, algorithms, and systems code.",
-        "gcc, g++, make, cmake, gdb",
-    ),
-    PHP(
-        "PHP",
-        "Websites and apps with PHP — classic sites and Laravel projects.",
-        "php-cli, common extensions, and Composer",
+        "Node.js and npm (already included in Core runtime)",
     ),
 }
+
+/** Project type detected from workspace files */
+enum class ProjectType {
+    ANDROID("Android", "build.gradle, settings.gradle, AndroidManifest.xml"),
+    WEB_VITE("Vite", "vite.config.ts, package.json"),
+    WEB_NEXT("Next.js", "next.config.js, package.json"),
+    WEB_EXPRESS("Express", "package.json with express"),
+    WEB_STATIC("Static HTML", "index.html, package.json"),
+    UNKNOWN("Unknown", "No recognized project structure"),
+    ;
+
+    val displayName: String
+    val detectionHint: String
+
+    constructor(displayName: String, detectionHint: String) {
+        this.displayName = displayName
+        this.detectionHint = detectionHint
+    }
+}
+
+/** Result of smart project type detection */
+data class ProjectDetectionResult(
+    val projectType: ProjectType,
+    val confidence: Double, // 0.0 to 1.0
+    val details: List<String> = emptyList(),
+)
 
 data class ToolRequest(
     val approvalId: String = UUID.randomUUID().toString(),
@@ -184,6 +215,55 @@ sealed interface RuntimeEvent {
     data class PreviewStarted(override val sessionId: String, val url: String) : RuntimeEvent
     data class SessionCompleted(override val sessionId: String) : RuntimeEvent
     data class SessionFailed(override val sessionId: String, val reason: String) : RuntimeEvent
+
+    /** Cloud build started on GitHub Actions */
+    data class CloudBuildStarted(
+        override val sessionId: String,
+        val workflowUrl: String,
+        val runId: Long,
+    ) : RuntimeEvent
+
+    /** Cloud build progress update */
+    data class CloudBuildProgress(
+        override val sessionId: String,
+        val status: CloudBuildStatus,
+        val message: String,
+        val logsUrl: String?,
+    ) : RuntimeEvent
+
+    /** Cloud build completed */
+    data class CloudBuildCompleted(
+        override val sessionId: String,
+        val success: Boolean,
+        val artifactUrl: String?,
+        val apkPath: String?,
+        val runUrl: String,
+    ) : RuntimeEvent
+
+    /** Vercel deployment started */
+    data class VercelDeploymentStarted(
+        override val sessionId: String,
+        val deploymentUrl: String,
+    ) : RuntimeEvent
+
+    /** Vercel deployment completed */
+    data class VercelDeploymentCompleted(
+        override val sessionId: String,
+        val success: Boolean,
+        val previewUrl: String?,
+        val deploymentUrl: String,
+    ) : RuntimeEvent
+}
+
+enum class CloudBuildStatus {
+    PREPARING,
+    PUSHING_TO_GITHUB,
+    QUEUED,
+    BUILDING,
+    UPLOADING_ARTIFACT,
+    COMPLETED,
+    FAILED,
+    CANCELLED,
 }
 
 data class ChatMessage(

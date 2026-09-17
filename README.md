@@ -49,28 +49,28 @@
 
 <br />
 
-## Download Mobile Harness
+## Download Mobile-Harness-Lite
 
 <div align="center">
   <h3>Choose the edition that fits your setup</h3>
-  <p>Both editions contain the complete Mobile Harness app and support secure in-app updates beginning with v1.0.3.</p>
+  <p>Both editions contain the complete Mobile-Harness-Lite app and support secure in-app updates.</p>
 </div>
 
 <table>
   <tr>
     <td width="50%" valign="top" align="center">
-      <h3>Online Edition</h3>
-      <p><strong>44.6 MB · Recommended</strong></p>
-      <p>Start with the smaller APK. Core, Python, and Android runtime bundles are downloaded only when needed.</p>
-      <a href="https://github.com/techjarves/Mobile-Harness/releases/download/v1.0.3/mobile-harness-online-v1.0.3.apk">
+      <h3>Online Edition (Cloud-First)</h3>
+      <p><strong>~45 MB · Recommended for most users</strong></p>
+      <p>Start with the smaller APK. Core runtime is downloaded on demand from GitHub Releases. Android builds run on GitHub Actions; web deployments use Vercel. No local Android SDK/NDK/Python required on the tablet.</p>
+      <a href="https://github.com/techjarves/Mobile-Harness/releases/latest">
         <img src="https://img.shields.io/badge/Download-Online_APK-F28C52?style=for-the-badge&logo=android&logoColor=white" alt="Download Online APK" />
       </a>
     </td>
     <td width="50%" valign="top" align="center">
       <h3>Offline Edition</h3>
-      <p><strong>818.5 MB · Everything included</strong></p>
+      <p><strong>~800+ MB · Everything included</strong></p>
       <p>Includes the Core, Python, and Android runtime bundles for setup with limited or unavailable internet.</p>
-      <a href="https://github.com/techjarves/Mobile-Harness/releases/download/v1.0.3/mobile-harness-offline-v1.0.3.apk">
+      <a href="https://github.com/techjarves/Mobile-Harness/releases/latest">
         <img src="https://img.shields.io/badge/Download-Offline_APK-5B8DEF?style=for-the-badge&logo=android&logoColor=white" alt="Download Offline APK" />
       </a>
     </td>
@@ -81,6 +81,79 @@
   <strong>ARM64 Android 9+</strong><br />
   <sub>Direct APK installation · No root required · No USB or wireless ADB pairing</sub>
 </p>
+
+### This is the Lightweight Online/Cloud-First Edition
+
+Mobile-Harness-Lite is a **cloud-first** variant designed for tablets like the Samsung Galaxy Tab A9 (3 GB RAM):
+
+- **No local Android build toolchain** — APKs are built remotely on GitHub Actions
+- **No local web preview server** — Web projects deploy to Vercel for instant preview URLs
+- **No Python/C++/NDK on device** — Only Node.js, Git, and Claude Code CLI run locally
+- **Heavy builds run in the cloud** — Your tablet stays light and responsive
+
+All GitHub Releases contain both editions. The Online edition is recommended for most users with internet access.
+
+### How to Create a Release
+
+To publish a new release with APK assets:
+
+```bash
+# 1. Ensure you're on main branch with all changes committed
+git checkout main
+git pull origin main
+
+# 2. Create and push a version tag (e.g., v1.0.3)
+git tag v1.0.3
+git push origin v1.0.3
+```
+
+This triggers the **Release APK** GitHub Actions workflow which:
+1. Builds the ONLINE release APK (lightweight cloud-first edition)
+2. Optionally builds the OFFLINE release APK
+3. Validates the APK (exists, non-empty, correct version/package)
+4. Calculates SHA-256 checksum
+5. Creates a GitHub Release with the tag
+6. Uploads the APK as a release asset
+
+#### Manual Release (via workflow_dispatch)
+
+You can also trigger a release manually from the Actions tab:
+
+1. Go to **Actions → Release APK → Run workflow**
+2. Enter version (e.g., `1.0.3`)
+3. Optional: Enter custom tag (defaults to `v{version}`)
+4. Select flavor: `online` (default) or `offline`
+5. Click **Run workflow**
+
+#### Required GitHub Secrets for Signed Releases
+
+For production signed releases, add these secrets in **Settings → Secrets and variables → Actions**:
+
+| Secret | Description |
+|--------|-------------|
+| `KEYSTORE_BASE64` | Base64-encoded release keystore (`.keystore` or `.jks`) |
+| `KEYSTORE_PASSWORD` | Keystore password |
+| `KEY_ALIAS` | Key alias in the keystore |
+| `KEY_PASSWORD` | Key password |
+
+Without these secrets, the workflow will fail clearly for production releases rather than producing an unsigned or misleadingly signed APK.
+
+#### Release APK Naming Convention
+
+| Edition | Filename Pattern |
+|---------|------------------|
+| Online | `Mobile-Harness-Lite-v1.0.3-online-release.apk` |
+| Offline | `Mobile-Harness-Lite-v1.0.3-offline-release.apk` |
+
+#### Verify Release APK
+
+```bash
+# Verify SHA-256 matches release notes
+sha256sum Mobile-Harness-Lite-v1.0.3-online-release.apk
+
+# Inspect APK metadata (requires Android build tools)
+aapt2 dump badging Mobile-Harness-Lite-v1.0.3-online-release.apk
+```
 
 <br />
 

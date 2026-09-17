@@ -105,6 +105,8 @@ import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -169,6 +171,7 @@ import com.jarves.mh.model.ActivityItem
 import com.jarves.mh.model.ChangeItem
 import com.jarves.mh.model.ChatMessage
 import com.jarves.mh.model.ChatAttachment
+import com.jarves.mh.model.CloudBuildStatus
 import com.jarves.mh.model.DevStack
 import com.jarves.mh.model.DiffLine
 import com.jarves.mh.model.DiffLineType
@@ -214,6 +217,7 @@ private enum class WorkspaceTab(val label: String, val icon: ImageVector) {
     TERMINAL("Terminal", Icons.Default.Terminal),
     CHANGES("Changes", Icons.Default.Code),
     PREVIEW("Preview", Icons.Default.Preview),
+    BUILD("Build", Icons.Default.CloudQueue),
 }
 
 @Composable
@@ -306,7 +310,8 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
             onAddAttachments = viewModel::addChatAttachments,
             onRemoveAttachment = viewModel::removePendingAttachment,
             onOpenAttachment = viewModel::openChatAttachment,
-            onBuildAndRunAndroid = viewModel::buildAndRunAndroidApp,
+            onBuildApkCloud = viewModel::buildApkCloud,
+            onDeployToVercel = viewModel::deployToVercel,
         )
         else -> RootScreenHost(state, viewModel, projectsListState)
     }
@@ -1506,6 +1511,7 @@ private fun RootScreenHost(
                     onCreateQuickProject = viewModel::createQuickProject,
                     onRenameProject = viewModel::renameProject,
                     onDeleteProject = viewModel::deleteProject,
+                    onProjectSettings = viewModel::updateProject,
                     onSettings = { screen = RootScreen.SETTINGS },
                     onPing = viewModel::pingApi,
                     onToggleTheme = viewModel::toggleTheme,
@@ -1538,6 +1544,13 @@ private fun RootScreenHost(
                     initialDebugUpdateManifestUrl = viewModel.debugUpdateManifestUrl(),
                     onSetDebugUpdateManifestUrl = viewModel::setDebugUpdateManifestUrl,
                     onClearDebugUpdateManifestUrl = viewModel::clearDebugUpdateManifestUrl,
+                    // Cloud services
+                    getGitHubToken = viewModel::getGitHubToken,
+                    onSaveGitHubToken = viewModel::saveGitHubToken,
+                    getVercelToken = viewModel::getVercelToken,
+                    onSaveVercelToken = viewModel::saveVercelToken,
+                    onTestGitHubConnection = viewModel::testGitHubConnection,
+                    onTestVercelConnection = viewModel::testVercelConnection,
                 )
             }
         }
@@ -2144,6 +2157,7 @@ private fun ProjectsScreen(
     onCreateQuickProject: () -> Unit,
     onRenameProject: (String, String) -> Unit,
     onDeleteProject: (String) -> Unit,
+    onProjectSettings: (Project) -> Unit,
     onSettings: () -> Unit,
     onPing: () -> Unit,
     onToggleTheme: () -> Unit,
@@ -2305,6 +2319,7 @@ private fun ProjectsScreen(
                         onOpen = { onOpen(project) },
                         onRename = { onRenameProject(project.id, it) },
                         onDelete = { onDeleteProject(project.id) },
+                        onSettings = onProjectSettings,
                     )
                 }
             }
@@ -2453,10 +2468,17 @@ private fun ApiStatusChip(state: AppUiState, onSettings: () -> Unit, onPing: () 
 
 
 @Composable
-private fun ProjectCard(project: Project, onOpen: () -> Unit, onRename: (String) -> Unit, onDelete: () -> Unit) {
+private fun ProjectCard(
+    project: Project,
+    onOpen: () -> Unit,
+    onRename: (String) -> Unit,
+    onDelete: () -> Unit,
+    onSettings: (Project) -> Unit,
+) {
     var menuOpen by rememberSaveable(project.id) { mutableStateOf(false) }
     var showRename by rememberSaveable(project.id) { mutableStateOf(false) }
     var showDelete by rememberSaveable(project.id) { mutableStateOf(false) }
+    var showSettings by rememberSaveable(project.id) { mutableStateOf(false) }
     var renameText by rememberSaveable(project.id) { mutableStateOf(project.name) }
     Card(Modifier.fillMaxWidth().clickable(onClick = onOpen), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Row(Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2478,6 +2500,11 @@ private fun ProjectCard(project: Project, onOpen: () -> Unit, onRename: (String)
             Box {
                 IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Project options") }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Settings") },
+                        leadingIcon = { Icon(Icons.Default.Settings, null) },
+                        onClick = { menuOpen = false; showSettings = true },
+                    )
                     DropdownMenuItem(
                         text = { Text("Rename project") },
                         leadingIcon = { Icon(Icons.Default.Edit, null) },
@@ -2510,6 +2537,99 @@ private fun ProjectCard(project: Project, onOpen: () -> Unit, onRename: (String)
             dismissButton = { TextButton(onClick = { showDelete = false }) { Text("Cancel") } },
         )
     }
+    if (showSettings) {
+        ProjectSettingsDialog(project = project, onDismiss = { showSettings = false }, onSave = { updatedProject ->
+            onSettings(updatedProject)
+            showSettings = false
+        })
+    }
+}
+
+@Composable
+private fun ProjectSettingsDialog(
+    project: Project,
+    onDismiss: () -> Unit,
+    onSave: (Project) -> Unit,
+) {
+    var owner by remember { mutableStateOf(project.githubRepoLink?.owner ?: "") }
+    var repo by remember { mutableStateOf(project.githubRepoLink?.repo ?: "") }
+    var branch by remember { mutableStateOf(project.githubRepoLink?.branch ?: "main") }
+    var vercelProjectId by remember { mutableStateOf(project.vercelProjectId ?: "") }
+    var showError by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf("") }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Project Settings") },
+        text = {
+            Column(Modifier.padding(16.dp).width(280.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                // GitHub Repository Section
+                Text("GitHub Repository", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Link a GitHub repository for cloud builds and Vercel deployments.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                
+                OutlinedTextField(
+                    value = owner,
+                    onValueChange = { owner = it },
+                    label = { Text("Owner (username or org)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = repo,
+                    onValueChange = { repo = it },
+                    label = { Text("Repository name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = branch,
+                    onValueChange = { branch = it },
+                    label = { Text("Branch") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(8.dp))
+                
+                // Vercel Project Section
+                Text("Vercel Project", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Optional: Enter existing Vercel project ID to link.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                
+                OutlinedTextField(
+                    value = vercelProjectId,
+                    onValueChange = { vercelProjectId = it },
+                    label = { Text("Vercel Project ID") },
+                    placeholder = { Text("prj_...") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                
+                if (showError) {
+                    Text(errorMessage, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (repo.isBlank() && owner.isNotBlank()) {
+                    showError = true
+                    errorMessage = "Repository name is required"
+                } else {
+                    val githubLink = if (owner.isNotBlank() && repo.isNotBlank()) {
+                        GitHubRepoLink(owner, repo, branch.ifBlank { "main" })
+                    } else null
+                    val updated = project.copy(
+                        githubRepoLink = githubLink,
+                        vercelProjectId = vercelProjectId.ifBlank { null },
+                    )
+                    onSave(updated)
+                }
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -2544,11 +2664,14 @@ private fun WorkspaceScreen(
     onAddAttachments: (List<Uri>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onOpenAttachment: (ChatAttachment) -> Unit,
-    onBuildAndRunAndroid: () -> Unit,
+    onBuildApkCloud: () -> Unit,
+    onDeployToVercel: () -> Unit,
 ) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
-    val isAndroidProject = state.androidProjectDetected
+    val isAndroidProject = state.projectType == com.jarves.mh.model.ProjectType.ANDROID
+    val isWebProject = state.projectType != com.jarves.mh.model.ProjectType.ANDROID &&
+        state.projectType != com.jarves.mh.model.ProjectType.UNKNOWN
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val exportProjectLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/zip"),
@@ -2557,16 +2680,6 @@ private fun WorkspaceScreen(
     val attachmentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = onAddAttachments,
-    )
-    val unknownAppsLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult(),
-        onResult = {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()) {
-                onBuildAndRunAndroid()
-            } else {
-                Toast.makeText(context, "Allow app installs to run Android projects", Toast.LENGTH_LONG).show()
-            }
-        },
     )
     val chatListState = rememberLazyListState()
     var userScrolledUp by rememberSaveable { mutableStateOf(false) }
@@ -2698,24 +2811,23 @@ private fun WorkspaceScreen(
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Projects") } },
                 actions = {
                     if (isAndroidProject) {
+                        // Build APK via GitHub Actions (Cloud Build)
                         IconButton(
-                            onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                                    !context.packageManager.canRequestPackageInstalls()) {
-                                    unknownAppsLauncher.launch(
-                                        Intent(
-                                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                            Uri.parse("package:${context.packageName}"),
-                                        ),
-                                    )
-                                } else {
-                                    onBuildAndRunAndroid()
-                                }
-                            },
-                            enabled = !state.androidBuildRunning && !state.isRunning && !state.projectTerminalRunning,
+                            onClick = onBuildApkCloud,
+                            enabled = !state.cloudBuildRunning && !state.isRunning && !state.projectTerminalRunning,
                         ) {
-                            if (state.androidBuildRunning) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                            else Icon(Icons.Default.PlayArrow, "Build and run Android app")
+                            if (state.cloudBuildRunning) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Default.CloudQueue, "Build APK in cloud")
+                        }
+                    }
+                    if (isWebProject) {
+                        // Deploy to Vercel
+                        IconButton(
+                            onClick = onDeployToVercel,
+                            enabled = !state.vercelDeployRunning && !state.isRunning && !state.projectTerminalRunning,
+                        ) {
+                            if (state.vercelDeployRunning) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Default.Cloud, "Deploy to Vercel")
                         }
                     }
                     IconButton(onClick = { showChats = true }) { Icon(Icons.Default.History, "Project chats") }
@@ -2812,6 +2924,29 @@ private fun WorkspaceScreen(
                     onKeepFileChange,
                 )
                 WorkspaceTab.PREVIEW -> PreviewTab(state.previewReady, state.previewUrl)
+                WorkspaceTab.BUILD -> BuildTab(
+                    isAndroidProject = state.projectType == com.jarves.mh.model.ProjectType.ANDROID,
+                    isWebProject = state.projectType != com.jarves.mh.model.ProjectType.ANDROID &&
+                        state.projectType != com.jarves.mh.model.ProjectType.UNKNOWN,
+                    cloudBuildRunning = state.cloudBuildRunning,
+                    cloudBuildStatus = state.cloudBuildStatus,
+                    cloudBuildMessage = state.cloudBuildMessage,
+                    cloudBuildLogsUrl = state.cloudBuildLogsUrl,
+                    cloudBuildApkPath = state.cloudBuildApkPath,
+                    cloudBuildRunUrl = state.cloudBuildRunUrl,
+                    vercelDeployRunning = state.vercelDeployRunning,
+                    vercelDeployStatus = state.vercelDeployStatus,
+                    vercelDeployMessage = state.vercelDeployMessage,
+                    vercelDeployPreviewUrl = state.vercelDeployPreviewUrl,
+                    vercelDeployUrl = state.vercelDeployUrl,
+                    isOnline = state.isOnline,
+                    onBuildApk = onBuildApkCloud,
+                    onDeployToVercel = onDeployToVercel,
+                    onCancelBuild = viewModel::cancelCloudBuild,
+                    onCancelVercel = viewModel::cancelVercelDeploy,
+                    onRefreshBuild = viewModel::refreshCloudBuild,
+                    onOpenGitHubActions = viewModel::openGitHubActions,
+                )
             }
         }
     }
@@ -4053,6 +4188,249 @@ private fun PreviewTab(ready: Boolean, url: String?) {
                     if (current.url != targetUrl) current.loadUrl(targetUrl)
                 },
                 modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun BuildTab(
+    isAndroidProject: Boolean,
+    isWebProject: Boolean,
+    cloudBuildRunning: Boolean,
+    cloudBuildStatus: com.jarves.mh.model.CloudBuildStatus?,
+    cloudBuildMessage: String?,
+    cloudBuildLogsUrl: String?,
+    cloudBuildApkPath: String?,
+    cloudBuildRunUrl: String?,
+    vercelDeployRunning: Boolean,
+    vercelDeployStatus: String?,
+    vercelDeployMessage: String?,
+    vercelDeployPreviewUrl: String?,
+    vercelDeployUrl: String?,
+    isOnline: Boolean,
+    onBuildApk: () -> Unit,
+    onDeployToVercel: () -> Unit,
+    onCancelBuild: () -> Unit,
+    onCancelVercel: () -> Unit,
+    onRefreshBuild: () -> Unit,
+    onOpenGitHubActions: () -> Unit,
+) {
+    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        // Network status indicator
+        if (!isOnline) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
+            ) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.CloudOff, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onErrorContainer)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Offline — Cloud build and deploy require internet connection",
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+        }
+        
+        // Android Build Section
+        if (isAndroidProject) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudQueue, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Build APK (GitHub Actions)", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        "Build APKs on GitHub Actions servers — no local Android SDK required. " +
+                        "Your project is pushed to GitHub and built remotely.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    
+                    // Status
+                    if (cloudBuildRunning || cloudBuildStatus != null) {
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Status:", fontWeight = FontWeight.SemiBold)
+                                Text(cloudBuildMessage ?: cloudBuildStatus?.name ?: "Unknown",
+                                    color = when (cloudBuildStatus) {
+                                        CloudBuildStatus.COMPLETED -> Color(0xFF58C99C)
+                                        CloudBuildStatus.FAILED -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.primary
+                                    },
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                            if (cloudBuildLogsUrl != null) {
+                                Text("Logs: $cloudBuildLogsUrl", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (cloudBuildApkPath != null) {
+                                Text("APK: $cloudBuildApkPath", fontSize = 11.sp, color = Color(0xFF58C99C), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (cloudBuildRunUrl != null) {
+                                Text("Run: $cloudBuildRunUrl", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    
+                    // Action buttons
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = onBuildApk,
+                                enabled = !cloudBuildRunning && isOnline,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                if (cloudBuildRunning) {
+                                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Text("Build APK in Cloud")
+                                }
+                            }
+                            if (cloudBuildRunning) {
+                                OutlinedButton(
+                                    onClick = onCancelBuild,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Default.Stop, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Cancel")
+                                }
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = onRefreshBuild,
+                                enabled = cloudBuildRunning || cloudBuildStatus != null,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Icon(Icons.Default.Refresh, null, Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Refresh")
+                            }
+                            if (cloudBuildRunUrl != null) {
+                                OutlinedButton(
+                                    onClick = onOpenGitHubActions,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Default.OpenInNew, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Open Actions")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Web Deploy Section
+        if (isWebProject) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Cloud, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Deploy Preview (Vercel)", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        "Deploy web projects to Vercel for instant preview URLs. " +
+                        "Changes pushed to GitHub trigger automatic deployments.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    
+                    // Status
+                    if (vercelDeployRunning || vercelDeployStatus != null) {
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Status:", fontWeight = FontWeight.SemiBold)
+                                Text(vercelDeployMessage ?: vercelDeployStatus ?: "Unknown",
+                                    color = when (vercelDeployStatus) {
+                                        "READY" -> Color(0xFF58C99C)
+                                        "ERROR" -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.primary
+                                    },
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                            if (vercelDeployPreviewUrl != null) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("Preview:", fontWeight = FontWeight.SemiBold)
+                                    Text(vercelDeployPreviewUrl, fontSize = 12.sp, color = Color(0xFF58C99C), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                            if (vercelDeployUrl != null) {
+                                Text("Deployment: $vercelDeployUrl", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    
+                    // Action buttons
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = onDeployToVercel,
+                                enabled = !vercelDeployRunning && isOnline,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                if (vercelDeployRunning) {
+                                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Text("Deploy to Vercel")
+                                }
+                            }
+                            if (vercelDeployRunning) {
+                                OutlinedButton(
+                                    onClick = onCancelVercel,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Default.Stop, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Cancel")
+                                }
+                            }
+                        }
+                        if (vercelDeployPreviewUrl != null && vercelDeployStatus == "READY") {
+                            OutlinedButton(
+                                onClick = {
+                                    runCatching {
+                                        val context = LocalContext.current
+                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vercelDeployPreviewUrl!!))
+                                        context.startActivity(intent)
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Default.OpenInNew, null, Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Open Preview")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Empty state
+        if (!isAndroidProject && !isWebProject) {
+            EmptyState(
+                icon = Icons.Default.CloudOff,
+                title = "No project to build",
+                subtitle = "Open an Android or web project to use cloud build and deploy.",
             )
         }
     }

@@ -31,6 +31,14 @@ import com.jarves.mh.model.generateQuickChatIdentity
 import com.jarves.mh.network.ConnectionValidation
 import com.jarves.mh.network.ModelDiscoveryResult
 import com.jarves.mh.network.ProviderApiClient
+import com.jarves.mh.cloud.CloudBuildService
+import com.jarves.mh.cloud.VercelDeployService
+import com.jarves.mh.github.GitHubService
+import com.jarves.mh.model.BuildMode
+import com.jarves.mh.model.CloudBuildStatus
+import com.jarves.mh.model.ProjectDetectionResult
+import com.jarves.mh.model.ProjectDetector
+import com.jarves.mh.vercel.VercelService
 import com.jarves.mh.runtime.ClaudeRuntimeBridge
 import com.jarves.mh.runtime.NativeSpawnProcess
 import com.jarves.mh.runtime.RuntimeInstallProgress
@@ -39,7 +47,6 @@ import com.jarves.mh.runtime.RuntimeSetupController
 import com.jarves.mh.runtime.RuntimeSetupService
 import com.jarves.mh.runtime.RuntimeSetupSnapshot
 import com.jarves.mh.runtime.RuntimeSetupStatus
-import com.jarves.mh.runtime.AndroidAppInstaller
 import com.jarves.mh.update.AppUpdateInfo
 import com.jarves.mh.update.AppUpdater
 import java.io.File
@@ -109,7 +116,8 @@ data class AppUiState(
     val projectChats: List<ProjectChat> = emptyList(),
     val activeChatId: String? = null,
     val workspaceFiles: List<WorkspaceEntry> = emptyList(),
-    val androidProjectDetected: Boolean = false,
+    val projectType: com.jarves.mh.model.ProjectType = com.jarves.mh.model.ProjectType.UNKNOWN,
+    val projectDetectionDetails: List<String> = emptyList(),
     val filesLoading: Boolean = false,
     val openedFilePath: String? = null,
     val openedFileContent: String? = null,
@@ -147,8 +155,20 @@ data class AppUiState(
     val devStackMessage: String? = null,
     val devStackProgress: Float = 0f,
     val devStackBytes: Pair<Long, Long>? = null,
-    val androidBuildRunning: Boolean = false,
-    val androidBuildMessage: String? = null,
+    // Cloud Build state
+    val cloudBuildRunning: Boolean = false,
+    val cloudBuildStatus: CloudBuildStatus? = null,
+    val cloudBuildMessage: String? = null,
+    val cloudBuildLogsUrl: String? = null,
+    val cloudBuildApkPath: String? = null,
+    val cloudBuildRunUrl: String? = null,
+    // Vercel Deployment state
+    val vercelDeployRunning: Boolean = false,
+    val vercelDeployStatus: String? = null, // READY, BUILDING, ERROR, QUEUED
+    val vercelDeployMessage: String? = null,
+    val vercelDeployPreviewUrl: String? = null,
+    val vercelDeployUrl: String? = null,
+    val isOnline: Boolean = true,
     val appUpdate: AppUpdateInfo? = null,
     val appUpdateStatus: AppUpdateStatus? = null,
     val appUpdateDownloadedBytes: Long = 0L,
@@ -162,6 +182,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val runtime = ClaudeRuntimeBridge(application) { profile -> vault.get(profile.kind.name) }
     private val installer = RuntimeInstaller(application)
     private val providerApi = ProviderApiClient()
+    private val githubService = GitHubService(application)
+    private val vercelService = VercelService(application)
+    private val cloudBuildService = CloudBuildService(application)
+    private val vercelDeployService = VercelDeployService(application)
     private fun appUpdater(): AppUpdater = AppUpdater(
         getApplication(),
         if (BuildConfig.DEBUG) preferences.debugUpdateManifestUrl else "",
@@ -171,6 +195,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var projectTerminalProjectId: String? = null
     @Volatile private var projectTerminalStopRequested: Boolean = false
     @Volatile private var setupCompletionHandled: Boolean = false
+
+    // Network monitoring
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var connectivityManager: android.net.ConnectivityManager? = null
+    // Cloud build job for cancellation
+    private var cloudBuildJob: kotlinx.coroutines.Job? = null
+    private var vercelDeployJob: kotlinx.coroutines.Job? = null
     private val _state = MutableStateFlow(
         AppUiState(
             onboardingComplete = preferences.onboardingComplete,
@@ -672,59 +703,156 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return selected.apply { mkdirs() }
     }
 
-    fun buildAndRunAndroidApp() {
+    /** Build APK using GitHub Actions (Cloud Build Mode). */
+    fun buildApkCloud() {
         val project = _state.value.activeProject ?: return
-        if (_state.value.androidBuildRunning) return
+        if (_state.value.cloudBuildRunning) return
+        if (!_state.value.isOnline) {
+            _state.update { it.copy(toastMessage = "No internet connection. Cloud build requires internet.") }
+            return
+        }
         if (_state.value.isRunning) {
-            _state.update { it.copy(toastMessage = "Wait for Claude to finish creating the project before building.") }
+            _state.update { it.copy(toastMessage = "Wait for the AI agent to finish before starting a cloud build.") }
             return
         }
         if (_state.value.projectTerminalRunning) {
             _state.update { it.copy(toastMessage = "Wait for the project terminal command to finish before building.") }
             return
         }
-        _state.update { it.copy(androidBuildRunning = true, androidBuildMessage = "Building debug APK…", toastMessage = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val installed = installer.installedRuntime()
-                val workspace = findAndroidGradleProjectRoot(projectWorkspaceRoot(project))
-                    ?: error("No Android Gradle project found yet. Ask Claude to create it, then wait for the task to finish.")
-                val process = installer.process(
-                    installed.proot, installed.rootfs, workspace, emptyMap(),
-                    listOf(
-                        "/usr/bin/bash", "-lc",
-                        "gradle --init-script /root/.gradle/init.d/pocketdev-android.gradle " +
-                            "-Pandroid.aapt2FromMavenOverride=/root/android-sdk/build-tools/35.0.0/aapt2 " +
-                            "--no-daemon assembleDebug --console=plain",
-                    ),
-                    projectGuestRoot(project),
-                )
-                val exitCode = process.waitFor()
-                val buildOutput = (process as? NativeSpawnProcess)?.outputFile?.readText().orEmpty()
-                check(exitCode == 0) {
-                    buildOutput.trim().takeLast(2_000).ifBlank { "Gradle build failed (exit code $exitCode)" }
-                }
-                val apk = workspace.walkTopDown()
-                    .filter { it.isFile && it.extension.equals("apk", ignoreCase = true) && it.path.contains("/outputs/apk/debug/") }
-                    .maxByOrNull(File::lastModified)
-                    ?: error("Gradle finished but no debug APK was found")
-                AndroidAppInstaller.install(getApplication(), apk)
-            }.onSuccess {
-                withContext(Dispatchers.Main) {
-                    _state.update {
-                        it.copy(
-                            androidBuildRunning = false,
-                            androidBuildMessage = "APK sent to Android installer",
-                            toastMessage = "APK built. Complete Android's install prompt.",
-                        )
+        
+        // Check GitHub authentication
+        if (!githubService.isConfigured()) {
+            _state.update { it.copy(toastMessage = "GitHub not configured. Add a GitHub token in Settings to use Cloud Build.") }
+            return
+        }
+        
+        // Check GitHub repo is linked
+        if (project.githubRepoLink == null) {
+            _state.update { it.copy(toastMessage = "No GitHub repository linked. Open project settings to link a repository.") }
+            return
+        }
+
+        _state.update { 
+            it.copy(
+                cloudBuildRunning = true, 
+                cloudBuildStatus = CloudBuildStatus.PREPARING,
+                cloudBuildMessage = "Preparing cloud build...",
+                cloudBuildLogsUrl = null,
+                cloudBuildApkPath = null,
+                cloudBuildRunUrl = null,
+                toastMessage = null
+            ) 
+        }
+        
+        val detection = _state.value.projectType
+        cloudBuildJob = viewModelScope.launch {
+            val result = cloudBuildService.buildApk(project, _state.value.projectDetectionDetails.toDetectionResult(), onEvent = { event ->
+                _state.update { current ->
+                    when (event) {
+                        is com.jarves.mh.model.RuntimeEvent.CloudBuildStarted -> {
+                            current.copy(
+                                cloudBuildRunning = true,
+                                cloudBuildStatus = CloudBuildStatus.PREPARING,
+                                cloudBuildMessage = "Starting build...",
+                                cloudBuildLogsUrl = event.logsUrl,
+                                cloudBuildRunUrl = event.workflowUrl,
+                            )
+                        }
+                        is com.jarves.mh.model.RuntimeEvent.CloudBuildProgress -> {
+                            current.copy(
+                                cloudBuildStatus = event.status,
+                                cloudBuildMessage = event.message,
+                                cloudBuildLogsUrl = event.logsUrl,
+                            )
+                        }
+                        is com.jarves.mh.model.RuntimeEvent.CloudBuildCompleted -> {
+                            current.copy(
+                                cloudBuildRunning = false,
+                                cloudBuildStatus = if (event.success) CloudBuildStatus.COMPLETED else CloudBuildStatus.FAILED,
+                                cloudBuildMessage = if (event.success) "Build completed successfully!" else "Build failed: check logs",
+                                cloudBuildApkPath = event.apkPath,
+                                cloudBuildRunUrl = event.runUrl,
+                                toastMessage = if (event.success) "APK ready! Check the build artifacts." else "Build failed. Check GitHub Actions logs.",
+                            )
+                        }
+                        else -> current
                     }
                 }
-            }.onFailure { error ->
-                withContext(Dispatchers.Main) {
-                    _state.update { it.copy(androidBuildRunning = false, androidBuildMessage = null, toastMessage = error.message ?: "Could not build APK") }
-                }
-            }
+            })
+            
+            // Result is handled via events
         }
+    }
+
+    /** Deploy web project to Vercel. */
+    fun deployToVercel() {
+        val project = _state.value.activeProject ?: return
+        if (_state.value.vercelDeployRunning) return
+        if (!_state.value.isOnline) {
+            _state.update { it.copy(toastMessage = "No internet connection. Vercel deployment requires internet.") }
+            return
+        }
+        if (_state.value.isRunning) {
+            _state.update { it.copy(toastMessage = "Wait for the AI agent to finish before deploying.") }
+            return
+        }
+        
+        // Check Vercel authentication
+        if (!vercelService.isConfigured()) {
+            _state.update { it.copy(toastMessage = "Vercel not configured. Add a Vercel token in Settings to deploy.") }
+            return
+        }
+
+        // Check GitHub repo is linked
+        if (project.githubRepoLink == null) {
+            _state.update { it.copy(toastMessage = "No GitHub repository linked. Open project settings to link a repository.") }
+            return
+        }
+
+        _state.update { 
+            it.copy(
+                vercelDeployRunning = true, 
+                vercelDeployStatus = "QUEUED",
+                vercelDeployMessage = "Preparing deployment...",
+                vercelDeployPreviewUrl = null,
+                vercelDeployUrl = null,
+                toastMessage = null
+            ) 
+        }
+        
+        vercelDeployJob = viewModelScope.launch {
+            val result = vercelDeployService.deploy(project, _state.value.projectDetectionDetails.toDetectionResult(), onEvent = { event ->
+                _state.update { current ->
+                    when (event) {
+                        is com.jarves.mh.model.RuntimeEvent.VercelDeploymentStarted -> {
+                            current.copy(
+                                vercelDeployRunning = true,
+                                vercelDeployStatus = "BUILDING",
+                                vercelDeployMessage = "Deploying to Vercel...",
+                                vercelDeployUrl = event.deploymentUrl,
+                            )
+                        }
+                        is com.jarves.mh.model.RuntimeEvent.VercelDeploymentCompleted -> {
+                            current.copy(
+                                vercelDeployRunning = false,
+                                vercelDeployStatus = if (event.success) "READY" else "ERROR",
+                                vercelDeployMessage = if (event.success) "Deployment ready!" else "Deployment failed",
+                                vercelDeployPreviewUrl = event.previewUrl,
+                                vercelDeployUrl = event.deploymentUrl,
+                                previewReady = event.success,
+                                previewUrl = event.previewUrl,
+                                toastMessage = if (event.success) "Preview ready! Tap to open." else "Deployment failed. Check Vercel logs.",
+                            )
+                        }
+                        else -> current
+                    }
+                }
+            })
+        }
+    }
+
+    private fun List<String>.toDetectionResult(): com.jarves.mh.model.ProjectDetectionResult {
+        return com.jarves.mh.model.ProjectDetector.detectFromFiles(this)
     }
 
     private fun findAndroidGradleProjectRoot(workspace: File): File? {
@@ -762,6 +890,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { RuntimeSetupController.snapshot.collect(::onSetupSnapshot) }
         viewModelScope.launch { runtime.events.collect(::onRuntimeEvent) }
         viewModelScope.launch { bootstrap() }
+        // Monitor network connectivity
+        viewModelScope.launch {
+            val cm = getApplication<Application>()
+                .getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            connectivityManager = cm
+            val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    _state.update { it.copy(isOnline = true) }
+                }
+                override fun onLost(network: android.net.Network) {
+                    _state.update { it.copy(isOnline = false) }
+                }
+            }
+            networkCallback = callback
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        connectivityManager?.let { cm ->
+            networkCallback?.let { cb ->
+                cm.unregisterNetworkCallback(cb)
+            }
+        }
     }
 
     private suspend fun bootstrap() {
@@ -1024,6 +1180,134 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Get stored GitHub token. */
+    fun getGitHubToken(): String? = preferences.loadGitHubToken()
+
+    /** Save GitHub token. */
+    fun saveGitHubToken(token: String) {
+        preferences.saveGitHubToken(token)
+    }
+
+    /** Get stored Vercel token. */
+    fun getVercelToken(): String? = preferences.loadVercelToken()
+
+    /** Save Vercel token. */
+    fun saveVercelToken(token: String) {
+        preferences.saveVercelToken(token)
+    }
+
+    /** Test GitHub connection. */
+    fun testGitHubConnection() {
+        viewModelScope.launch {
+            if (!githubService.isConfigured()) {
+                _state.update { it.copy(toastMessage = "No GitHub token saved") }
+                return@launch
+            }
+            _state.update { it.copy(toastMessage = "Testing GitHub connection...") }
+            try {
+                val login = githubService.getUserLogin()
+                _state.update { it.copy(toastMessage = "Connected as $login") }
+            } catch (e: Exception) {
+                _state.update { it.copy(toastMessage = "GitHub connection failed: ${e.message}") }
+            }
+        }
+    }
+
+    /** Test Vercel connection. */
+    fun testVercelConnection() {
+        viewModelScope.launch {
+            if (!vercelService.isConfigured()) {
+                _state.update { it.copy(toastMessage = "No Vercel token saved") }
+                return@launch
+            }
+            _state.update { it.copy(toastMessage = "Testing Vercel connection...") }
+            try {
+                val user = vercelService.getUser()
+                _state.update { it.copy(toastMessage = "Connected as ${user.username}") }
+            } catch (e: Exception) {
+                _state.update { it.copy(toastMessage = "Vercel connection failed: ${e.message}") }
+            }
+        }
+    }
+
+    /** Cancel an in-progress cloud build. */
+    fun cancelCloudBuild() {
+        // Cancel the local coroutine
+        cloudBuildJob?.cancel()
+        cloudBuildJob = null
+        
+        // GitHub Actions doesn't support direct cancellation via API without run ID
+        // We just update local state; the remote build will continue
+        _state.update {
+            it.copy(
+                cloudBuildRunning = false,
+                cloudBuildStatus = CloudBuildStatus.CANCELLED,
+                cloudBuildMessage = "Build cancelled locally (remote may continue)",
+            )
+        }
+    }
+
+    /** Cancel an in-progress Vercel deployment. */
+    fun cancelVercelDeploy() {
+        vercelDeployJob?.cancel()
+        vercelDeployJob = null
+        _state.update {
+            it.copy(
+                vercelDeployRunning = false,
+                vercelDeployStatus = "CANCELLED",
+                vercelDeployMessage = "Deployment cancelled locally",
+            )
+        }
+    }
+
+    /** Refresh cloud build status by polling. */
+    fun refreshCloudBuild() {
+        val project = _state.value.activeProject
+        val runUrl = _state.value.cloudBuildRunUrl
+        if (project == null || runUrl == null) return
+
+        viewModelScope.launch {
+            _state.update { it.copy(cloudBuildMessage = "Refreshing status...") }
+            // Extract owner/repo/runId from runUrl
+            // Format: https://github.com/owner/repo/actions/runs/123456
+            val runId = runUrl.split("/").lastOrNull()?.toLongOrNull() ?: return@launch
+            val parts = runUrl.split("/")
+            val owner = parts.getOrNull(3) ?: return@launch
+            val repo = parts.getOrNull(4) ?: return@launch
+
+            try {
+                val run = githubService.getWorkflowRun(owner, repo, runId)
+                _state.update { current ->
+                    current.copy(
+                        cloudBuildStatus = when (run.status) {
+                            "queued" -> CloudBuildStatus.QUEUED
+                            "in_progress" -> CloudBuildStatus.BUILDING
+                            "completed" -> if (run.conclusion == "success") CloudBuildStatus.COMPLETED else CloudBuildStatus.FAILED
+                            else -> CloudBuildStatus.BUILDING
+                        },
+                        cloudBuildMessage = "Build ${run.status} (${run.conclusion ?: "running"})",
+                        cloudBuildLogsUrl = run.htmlUrl,
+                        cloudBuildRunning = run.status != "completed",
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(toastMessage = "Failed to refresh: ${e.message}") }
+            }
+        }
+    }
+
+    /** Open GitHub Actions page in browser. */
+    fun openGitHubActions() {
+        val runUrl = _state.value.cloudBuildRunUrl
+        if (runUrl == null) return
+        runCatching {
+            val context = getApplication<Application>()
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(runUrl))
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        }
+    }
+
     fun finishOnboarding(profile: ProviderProfile, secret: String) {
         vault.put(profile.kind.name, secret)
         val saved = profile.copy(
@@ -1137,6 +1421,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val activeChat = chats.first()
         val saved = preferences.loadMessages(project.id, activeChat.id)
         val msgs = saved.ifEmpty { listOf(ChatMessage(fromUser = false, text = "Hi! Tell me what you want to build or change.")) }
+        
+        // Detect project type
+        val workspaceRoot = projectWorkspaceRoot(project)
+        val detection = ProjectDetector.detect(workspaceRoot)
+        
         _state.update {
             it.copy(
                 activeProject = project,
@@ -1149,7 +1438,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 taskFinishedAtMillis = null,
                 changes = emptyList(),
                 workspaceFiles = emptyList(),
-                androidProjectDetected = false,
+                projectType = detection.projectType,
+                projectDetectionDetails = detection.details,
                 filesLoading = true,
                 projectTerminalLines = terminal.lines,
                 projectTerminalLiveOutput = "",
@@ -1162,6 +1452,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 previewReady = false,
                 previewUrl = null,
                 pendingAttachments = emptyList(),
+                // Reset cloud build state
+                cloudBuildRunning = false,
+                cloudBuildStatus = null,
+                cloudBuildMessage = null,
+                cloudBuildLogsUrl = null,
+                cloudBuildApkPath = null,
+                cloudBuildRunUrl = null,
+                // Reset Vercel deploy state
+                vercelDeployRunning = false,
+                vercelDeployStatus = null,
+                vercelDeployMessage = null,
+                vercelDeployPreviewUrl = null,
+                vercelDeployUrl = null,
             )
         }
         refreshProjectFiles()
@@ -1305,6 +1608,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val active = current.activeProject?.let { project ->
                 if (project.id == projectId) project.copy(name = clean) else project
             }
+            current.copy(projects = projects, activeProject = active)
+        }
+        preferences.saveProjects(_state.value.projects)
+    }
+
+    fun updateProject(updatedProject: Project) {
+        _state.update { current ->
+            val projects = current.projects.map { project ->
+                if (project.id == updatedProject.id) updatedProject else project
+            }
+            val active = if (current.activeProject?.id == updatedProject.id) updatedProject else current.activeProject
             current.copy(projects = projects, activeProject = active)
         }
         preferences.saveProjects(_state.value.projects)
@@ -1464,20 +1778,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val project = _state.value.activeProject ?: return
         _state.update { it.copy(filesLoading = true) }
         viewModelScope.launch {
-            val (entries, suggestedRoot, androidProjectDetected) = withContext(Dispatchers.IO) {
-                Triple(
-                    readWorkspace(project),
-                    if (project.rootPath.isBlank()) detectNestedProjectRoot(project) else null,
-                    findAndroidGradleProjectRoot(projectWorkspaceRoot(project)) != null,
-                )
+            val (entries, suggestedRoot, detection) = withContext(Dispatchers.IO) {
+                val workspaceRoot = projectWorkspaceRoot(project)
+                val entries = readWorkspace(project)
+                val suggestedRoot = if (project.rootPath.isBlank()) detectNestedProjectRoot(project) else null
+                val detection = ProjectDetector.detect(workspaceRoot)
+                Triple(entries, suggestedRoot, detection)
             }
             if (_state.value.activeProject?.id == project.id) {
                 _state.update {
                     it.copy(
                         workspaceFiles = entries,
+                        projectType = detection.projectType,
+                        projectDetectionDetails = detection.details,
                         filesLoading = false,
                         suggestedProjectRoot = suggestedRoot,
-                        androidProjectDetected = androidProjectDetected,
                     )
                 }
             }

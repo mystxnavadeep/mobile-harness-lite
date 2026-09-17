@@ -47,6 +47,8 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -111,6 +113,13 @@ fun SettingsScreen(
     initialDebugUpdateManifestUrl: String = "",
     onSetDebugUpdateManifestUrl: (String) -> Unit = {},
     onClearDebugUpdateManifestUrl: () -> Unit = {},
+    // Cloud services
+    getGitHubToken: () -> String? = { null },
+    onSaveGitHubToken: (String) -> Unit = {},
+    getVercelToken: () -> String? = { null },
+    onSaveVercelToken: (String) -> Unit = {},
+    onTestGitHubConnection: () -> Unit = {},
+    onTestVercelConnection: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -418,6 +427,134 @@ fun SettingsScreen(
                             ) { Text("Open Developer options") }
                         }
                     }
+                }
+            }
+
+            // Cloud Services Section
+            item {
+                val githubToken = getGitHubToken()
+                val vercelToken = getVercelToken()
+                val githubConnected = githubToken != null && githubToken.isNotBlank()
+                val vercelConnected = vercelToken != null && vercelToken.isNotBlank()
+                var githubTokenInput by remember { mutableStateOf("") }
+                var vercelTokenInput by remember { mutableStateOf("") }
+                var githubTokenVisible by remember { mutableStateOf(false) }
+                var vercelTokenVisible by remember { mutableStateOf(false) }
+                var githubTesting by remember { mutableStateOf(false) }
+                var vercelTesting by remember { mutableStateOf(false) }
+                var githubTestResult by remember { mutableStateOf<String?>(null) }
+                var vercelTestResult by remember { mutableStateOf<String?>(null) }
+
+                SettingsAccordion(
+                    title = "Cloud services",
+                    subtitle = "GitHub: ${if (githubConnected) "Connected" else "Not connected"} · Vercel: ${if (vercelConnected) "Connected" else "Not connected"}",
+                    icon = Icons.Default.Cloud,
+                    expanded = expanded == SettingsSection.UPDATE_CHANNEL, // Reusing UPDATE_CHANNEL for cloud services
+                    onClick = { toggle(SettingsSection.UPDATE_CHANNEL) },
+                ) {
+                    Text("Configure cloud build and deployment services. Tokens are encrypted and stored in Android Keystore.", 
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+
+                    // GitHub Section
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CloudQueue, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(8.dp))
+                            Text("GitHub", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Spacer(Modifier.width(8.dp))
+                            if (githubConnected) {
+                                Text("Connected", fontSize = 12.sp, color = Color(0xFF58C99C), fontWeight = FontWeight.Bold)
+                            } else {
+                                Text("Not connected", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        OutlinedTextField(
+                            value = githubTokenInput,
+                            onValueChange = { githubTokenInput = it },
+                            label = { Text("GitHub Personal Access Token") },
+                            placeholder = { Text("ghp_...") },
+                            singleLine = true,
+                            visualTransformation = if (githubTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { githubTokenVisible = !githubTokenVisible }) {
+                                    Icon(
+                                        if (githubTokenVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                        contentDescription = if (githubTokenVisible) "Hide token" else "Show token",
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            isError = githubTestResult != null && !githubTestResult!!.contains("success", true),
+                        )
+                        if (githubTestResult != null) {
+                            Text(githubTestResult!!, fontSize = 11.sp, color = if (githubTestResult!!.contains("success", true)) Color(0xFF58C99C) else MaterialTheme.colorScheme.error)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onSaveGitHubToken(githubTokenInput); githubTokenInput = "" }, enabled = githubTokenInput.isNotBlank()) {
+                                Text(if (githubConnected) "Update token" else "Save token")
+                            }
+                            OutlinedButton(onClick = { githubTesting = true; scope.launch { onTestGitHubConnection() } }, enabled = !githubTesting && (githubConnected || githubTokenInput.isNotBlank())) {
+                                if (githubTesting) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) else Text("Test")
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    Spacer(Modifier.height(16.dp))
+
+                    // Vercel Section
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Cloud, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Vercel", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Spacer(Modifier.width(8.dp))
+                            if (vercelConnected) {
+                                Text("Connected", fontSize = 12.sp, color = Color(0xFF58C99C), fontWeight = FontWeight.Bold)
+                            } else {
+                                Text("Not connected", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        OutlinedTextField(
+                            value = vercelTokenInput,
+                            onValueChange = { vercelTokenInput = it },
+                            label = { Text("Vercel Access Token") },
+                            placeholder = { Text("vercel_...") },
+                            singleLine = true,
+                            visualTransformation = if (vercelTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { vercelTokenVisible = !vercelTokenVisible }) {
+                                    Icon(
+                                        if (vercelTokenVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                        contentDescription = if (vercelTokenVisible) "Hide token" else "Show token",
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            isError = vercelTestResult != null && !vercelTestResult!!.contains("success", true),
+                        )
+                        if (vercelTestResult != null) {
+                            Text(vercelTestResult!!, fontSize = 11.sp, color = if (vercelTestResult!!.contains("success", true)) Color(0xFF58C99C) else MaterialTheme.colorScheme.error)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onSaveVercelToken(vercelTokenInput); vercelTokenInput = "" }, enabled = vercelTokenInput.isNotBlank()) {
+                                Text(if (vercelConnected) "Update token" else "Save token")
+                            }
+                            OutlinedButton(onClick = { vercelTesting = true; scope.launch { onTestVercelConnection() } }, enabled = !vercelTesting && (vercelConnected || vercelTokenInput.isNotBlank())) {
+                                if (vercelTesting) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) else Text("Test")
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "GitHub token needs 'repo' and 'workflow' scopes. Vercel token needs project write access. " +
+                        "Tokens are stored securely in Android Keystore and never leave this device.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
 

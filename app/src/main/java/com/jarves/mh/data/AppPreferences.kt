@@ -1,6 +1,7 @@
 package com.jarves.mh.data
 
 import android.content.Context
+import com.jarves.mh.model.BuildMode
 import com.jarves.mh.model.ChatMessage
 import com.jarves.mh.model.ChatAttachment
 import com.jarves.mh.model.Project
@@ -69,6 +70,31 @@ class AppPreferences(private val context: Context) {
             preferences.edit().putString("selected_dev_stacks", arr.toString()).apply()
         }
 
+    /** GitHub authentication token (encrypted in Keystore via ApiKeyVault). */
+    fun saveGitHubToken(token: String) {
+        val vault = ApiKeyVault(context)
+        if (token.isBlank()) vault.remove("github") else vault.put("github", token)
+    }
+
+    fun loadGitHubToken(): String? = ApiKeyVault(context).get("github")
+
+    /** Vercel authentication token (encrypted in Keystore via ApiKeyVault). */
+    fun saveVercelToken(token: String) {
+        val vault = ApiKeyVault(context)
+        if (token.isBlank()) vault.remove("vercel") else vault.put("vercel", token)
+    }
+
+    fun loadVercelToken(): String? = ApiKeyVault(context).get("vercel")
+
+    /** GitHub username for display purposes. */
+    var gitHubUsername: String?
+        get() = preferences.getString("github_username", null)
+        set(value) { preferences.edit().putString("github_username", value).apply() }
+
+    /** Default GitHub repository for cloud builds. */
+    var defaultGitHubRepo: String?
+        get() = preferences.getString("github_default_repo", null)
+        set(value) { preferences.edit().putString("github_default_repo", value).apply() }
 
     fun saveProvider(profile: ProviderProfile) {
         preferences.edit()
@@ -101,6 +127,13 @@ class AppPreferences(private val context: Context) {
                 put("rootPath", p.rootPath)
                 put("updatedAtMillis", p.updatedAtMillis)
                 put("kind", p.kind.name)
+                put("buildMode", p.buildMode?.name ?: "")
+                p.githubRepoLink?.let { link ->
+                    put("githubRepoOwner", link.owner)
+                    put("githubRepoName", link.repo)
+                    put("githubRepoBranch", link.branch)
+                }
+                p.vercelProjectId?.let { put("vercelProjectId", it) }
             })
         }
         preferences.edit().putString("projects_json", arr.toString()).apply()
@@ -151,6 +184,14 @@ class AppPreferences(private val context: Context) {
                         else -> runCatching { ProjectKind.valueOf(storedKind) }
                             .getOrDefault(ProjectKind.PROJECT)
                     },
+                    buildMode = obj.optString("buildMode").takeIf(String::isNotBlank)
+                        ?.let { runCatching { BuildMode.valueOf(it) }.getOrNull() },
+                    githubRepoLink = (obj.optString("githubRepoOwner").takeIf(String::isNotBlank)?.let { owner ->
+                        val repo = obj.optString("githubRepoName").takeIf(String::isNotBlank) ?: ""
+                        val branch = obj.optString("githubRepoBranch").takeIf(String::isNotBlank) ?: "main"
+                        if (repo.isNotBlank()) com.jarves.mh.model.GitHubRepoLink(owner, repo, branch) else null
+                    }),
+                    vercelProjectId = obj.optString("vercelProjectId").takeIf(String::isNotBlank)
                 )
             }
         }.getOrDefault(emptyList())

@@ -35,8 +35,7 @@ val generatedRuntimeAssets = layout.buildDirectory.dir("generated/runtime-assets
 val prepareOfflineRuntimeAssets = tasks.register<Sync>("prepareOfflineRuntimeAssets") {
     from(
         runtimeBundleDir.file("pocketdev-core-arm64-2026.09.4.tar.zst"),
-        runtimeBundleDir.file("pocketdev-python-arm64-2026.09.2.tar.zst"),
-        runtimeBundleDir.file("pocketdev-android-arm64-2026.09.1.tar.zst"),
+        // Python and Android bundles removed in Lite mode - use cloud builds instead
     )
     into(generatedRuntimeAssets.map { it.dir("offline/runtime") })
 }
