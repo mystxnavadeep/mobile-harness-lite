@@ -57,11 +57,11 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 36
-          build-tools-version: 35.0.0
-          ndk-version: r26d
+        run: |
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "ndk;26.1.10909125" || true
 
       - name: Determine build flavor
         id: set_flavor
@@ -89,13 +89,22 @@ jobs:
         run: chmod +x ${{ steps.detect.outputs.project_root }}/gradlew
 
       - name: Configure GitHub Secrets for signing
-        if: secrets.KEYSTORE_BASE64 != '' && secrets.KEYSTORE_PASSWORD != '' && secrets.KEY_ALIAS != '' && secrets.KEY_PASSWORD != ''
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ${{ steps.detect.outputs.project_root }}/upload.keystore
-          echo "MH_UPLOAD_STORE_FILE=upload.keystore" >> $GITHUB_ENV
-          echo "MH_UPLOAD_STORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
-          echo "MH_UPLOAD_KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
-          echo "MH_UPLOAD_KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > ${{ steps.detect.outputs.project_root }}/upload.keystore
+            echo "MH_UPLOAD_STORE_FILE=upload.keystore" >> $GITHUB_ENV
+            echo "MH_UPLOAD_STORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "MH_UPLOAD_KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+            echo "MH_UPLOAD_KEY_PASSWORD=$KEY_PASSWORD" >> $GITHUB_ENV
+            echo "Signing keystore configured."
+          else
+            echo "Signing secrets not present. Skipping keystore configuration."
+          fi
 
       - name: Build Release APK
         working-directory: ${{ steps.detect.outputs.project_root }}
